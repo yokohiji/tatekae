@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>立て替え帳</title>
+
+<!-- ホーム画面追加時にブラウザのアドレスバー等を消してアプリらしく開かせるための設定 -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="立て替え帳" />
+<meta name="theme-color" content="#FAF6EE" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<link rel="icon" href="icon-192.png" />
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Firebase (Realtime Database) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+
+<style>
+  html, body { background: #FAF6EE; }
+  * { -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ---------- Firebase init ----------
+let db = null;
+let firebaseInitError = null;
+try {
+  firebase.initializeApp(firebaseConfig);
+  db = firebase.database();
+} catch (e) {
+  firebaseInitError = e.message || String(e);
+}
+
+const uid = () => Math.random().toString(36).slice(2, 9);
+const yen = (n) => `¥${Math.round(n).toLocaleString('ja-JP')}`;
+
+// ---------- settlement math ----------
+function computeBalances(members, expenses) {
+  const paid = Object.fromEntries(members.map((m) => [m, 0]));
+  const owed = Object.fromEntries(members.map((m) => [m, 0]));
+  for (const ex of expenses) {
+    if (paid[ex.payer] !== undefined) paid[ex.payer] += ex.amount;
+    if (ex.splitType === 'equal') {
+      const share = ex.amount / ex.participants.length;
+      ex.participants.forEach((p) => { if (owed[p] !== undefined) owed[p] += share; });
+    } else {
+      Object.entries(ex.customSplit || {}).forEach(([p, amt]) => {
+        if (owed[p] !== undefined) owed[p] += Number(amt) || 0;
+      });
+    }
+  }
+  const balance = Object.fromEntries(members.map((m) => [m, paid[m] - owed[m]]));
+  return { paid, owed, balance };
+}
+
+function settle(balance) {
+  const creditors = [];
+  const debtors = [];
+  Object.entries(balance).forEach(([m, b]) => {
+    if (b > 0.5) creditors.push({ m, b });
+    else if (b < -0.5) debtors.push({ m, b: -b });
+  });
+  creditors.sort((a, b) => b.b - a.b);
+  debtors.sort((a, b) => b.b - a.b);
+  const txns = [];
+  let i = 0, j = 0;
+  while (i < debtors.length && j < creditors.length) {
+    const d = debtors[i], c = creditors[j];
+    const amt = Math.min(d.b, c.b);
+    if (amt > 0.5) txns.push({ from: d.m, to: c.m, amount: amt });
+    d.b -= amt; c.b -= amt;
+    if (d.b <= 0.5) i++;
+    if (c.b <= 0.5) j++;
+  }
+  return txns;
+}
+
+// ---------- tiny inline icons (no external icon package needed) ----------
+const Icon = ({ children, size = 16, ...p }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}>{children}</svg>
+);
+const PlusIcon = (p) => <Icon {...p}><path d="M12 5v14M5 12h14"/></Icon>;
+const UsersIcon = (p) => <Icon {...p}><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></Icon>;
+const ReceiptIcon = (p) => <Icon {...p}><path d="M4 2h16v20l-3-2-3 2-3-2-3 2-3-2-1 1V2z"/><path d="M8 7h8M8 11h8M8 15h4"/></Icon>;
+const StampIcon = (p) => <Icon {...p}><circle cx="12" cy="9" r="6"/><path d="M12 15v3M7 22h10l-1.5-4h-7L7 22z"/></Icon>;
+const XIcon = (p) => <Icon {...p}><path d="M18 6 6 18M6 6l12 12"/></Icon>;
+const ArrowRightIcon = (p) => <Icon {...p}><path d="M5 12h14M13 6l6 6-6 6"/></Icon>;
+const ChevronLeftIcon = (p) => <Icon {...p}><path d="M15 18l-6-6 6-6"/></Icon>;
+const LoaderIcon = (p) => <Icon {...p} className="animate-spin"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></Icon>;
+
+const Divider = () => <div className="my-4 border-t border-dashed" style={{ borderColor: '#D9D2C0' }} />;
+
+function Stat({ label, value, tone }) {
+  return (
+    <div className="flex items-baseline justify-between py-1.5">
+      <span className="text-sm" style={{ color: '#6B6250' }}>{label}</span>
+      <span className="font-mono text-base tabular-nums font-semibold"
+        style={{ color: tone === 'plus' ? '#3E6259' : tone === 'minus' ? '#C23B3B' : '#1F2937' }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function App() {
+  const [phase, setPhase] = useState('loading'); // loading | home | room | configError
+  const [rooms, setRooms] = useState([]);
+  const [currentId, setCurrentId] = useState(null);
+  const [roomData, setRoomData] = useState(null);
+  const [saveError, setSaveError] = useState(null);
+  const roomListenerRef = useRef(null);
+
+  // ---- initial config check ----
+  useEffect(() => {
+    if (firebaseInitError || !db) {
+      setPhase('configError');
+      return;
+    }
+    const roomsRef = db.ref('rooms');
+    const cb = (snap) => {
+      const val = snap.val() || {};
+      const list = Object.entries(val)
+        .map(([id, v]) => ({ id, ...v }))
+        .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      setRooms(list);
+      setPhase((p) => (p === 'loading' ? 'home' : p));
+    };
+    roomsRef.on('value', cb, (err) => setSaveError('一覧の取得に失敗: ' + err.message));
+    return () => roomsRef.off('value', cb);
+  }, []);
+
+  // ---- room detail: realtime listener ----
+  const openRoom = useCallback((id) => {
+    setCurrentId(id);
+    setPhase('room');
+    setRoomData(null);
+    if (roomListenerRef.current) {
+      roomListenerRef.current.ref.off('value', roomListenerRef.current.cb);
+    }
+    const ref = db.ref('roomData/' + id);
+    const cb = (snap) => {
+      const raw = snap.val() || {};
+      // Firebaseは空配列を保存すると項目ごと消すため、読み込み時に必ず配列へ正規化する
+      setRoomData({
+        name: raw.name || '(名称未設定)',
+        members: Array.isArray(raw.members) ? raw.members : [],
+        expenses: Array.isArray(raw.expenses) ? raw.expenses : [],
+      });
+    };
+    ref.on('value', cb, (err) => setSaveError('記録の取得に失敗: ' + err.message));
+    roomListenerRef.current = { ref, cb };
+  }, []);
+
+  const goHome = useCallback(() => {
+    if (roomListenerRef.current) {
+      roomListenerRef.current.ref.off('value', roomListenerRef.current.cb);
+      roomListenerRef.current = null;
+    }
+    setPhase('home');
+  }, []);
+
+  async function writeRoomData(id, next) {
+    try {
+      await db.ref('roomData/' + id).set(next);
+      setSaveError(null);
+      return true;
+    } catch (e) {
+      setSaveError('保存に失敗しました: ' + (e.message || String(e)));
+      return false;
+    }
+  }
+
+  // ---------- create room ----------
+  const [newRoomName, setNewRoomName] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState(null);
+
+  async function createRoom() {
+    const name = newRoomName.trim();
+    if (!name) return;
+    setCreating(true);
+    setCreateError(null);
+    const id = uid();
+    const entry = { name, createdAt: new Date().toISOString() };
+    const fresh = { name, members: [], expenses: [] };
+    try {
+      await db.ref('roomData/' + id).set(fresh);
+      await db.ref('rooms/' + id).set(entry);
+      setNewRoomName('');
+      openRoom(id);
+    } catch (e) {
+      setCreateError(e.message || String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  // ---------- members ----------
+  const [newMemberName, setNewMemberName] = useState('');
+  async function addMember() {
+    const name = newMemberName.trim();
+    const currentMembers = roomData?.members || [];
+    if (!name || !roomData || currentMembers.includes(name)) return;
+    const next = { ...roomData, members: [...currentMembers, name] };
+    const ok = await writeRoomData(currentId, next);
+    if (ok) {
+      setNewMemberName('');
+      setExParticipants((p) => [...p, name]);
+      setExPayer((cur) => cur || name);
+    }
+  }
+  function removeMember(name) {
+    const next = { ...roomData, members: (roomData.members || []).filter((m) => m !== name) };
+    writeRoomData(currentId, next);
+  }
+
+  // ---------- expenses ----------
+  const [showAddExpense, setShowAddExpense] = useState(false);
+  const [exDesc, setExDesc] = useState('');
+  const [exAmount, setExAmount] = useState('');
+  const [exPayer, setExPayer] = useState('');
+  const [exSplitType, setExSplitType] = useState('equal');
+  const [exParticipants, setExParticipants] = useState([]);
+
+  // 個別入力(品目を1件ずつ積み上げる方式)
+  const [customItems, setCustomItems] = useState([]); // {id, name, amountExTax, taxRate, person}
+  const [itemName, setItemName] = useState('');
+  const [itemAmount, setItemAmount] = useState('');
+  const [itemTaxRate, setItemTaxRate] = useState(10);
+  const [itemPerson, setItemPerson] = useState('');
+
+  const taxIncluded = (exTax, rate) => Math.round(Number(exTax) * (1 + rate / 100));
+
+  useEffect(() => {
+    if (roomData && !exPayer) setExPayer((roomData.members || [])[0] || '');
+    if (roomData && !itemPerson) setItemPerson((roomData.members || [])[0] || '');
+    if (roomData && exParticipants.length === 0 && !showAddExpense) setExParticipants(roomData.members || []);
+  }, [roomData]);
+
+  function toggleParticipant(name) {
+    setExParticipants((p) => (p.includes(name) ? p.filter((x) => x !== name) : [...p, name]));
+  }
+  function resetExpenseForm() {
+    setExDesc(''); setExAmount(''); setExSplitType('equal');
+    setExParticipants(roomData?.members || []);
+    setCustomItems([]); setItemName(''); setItemAmount('');
+    setShowAddExpense(false);
+  }
+  function addItem() {
+    const amt = Number(itemAmount);
+    if (!amt || amt <= 0 || !itemPerson) return;
+    setCustomItems((list) => [...list, {
+      id: uid(), name: itemName.trim() || '(品名なし)', amountExTax: amt, taxRate: itemTaxRate, person: itemPerson,
+    }]);
+    setItemName(''); setItemAmount('');
+  }
+  function removeItem(id) {
+    setCustomItems((list) => list.filter((it) => it.id !== id));
+  }
+
+  async function addExpense() {
+    if (!exDesc.trim() || !exPayer) return;
+
+    let expense;
+    if (exSplitType === 'equal') {
+      const amount = Number(exAmount);
+      if (!amount || amount <= 0 || exParticipants.length === 0) return;
+      expense = {
+        id: uid(), desc: exDesc.trim(), amount, payer: exPayer, splitType: 'equal',
+        participants: exParticipants, customSplit: null, items: null,
+        createdAt: new Date().toISOString(),
+      };
+    } else {
+      if (customItems.length === 0) return;
+      const customSplit = {};
+      let total = 0;
+      customItems.forEach((it) => {
+        const inc = taxIncluded(it.amountExTax, it.taxRate);
+        customSplit[it.person] = (customSplit[it.person] || 0) + inc;
+        total += inc;
+      });
+      expense = {
+        id: uid(), desc: exDesc.trim(), amount: total, payer: exPayer, splitType: 'custom',
+        participants: Object.keys(customSplit), customSplit, items: customItems,
+        createdAt: new Date().toISOString(),
+      };
+    }
+    const next = { ...roomData, expenses: [expense, ...(roomData.expenses || [])] };
+    const ok = await writeRoomData(currentId, next);
+    if (ok) resetExpenseForm();
+  }
+  function removeExpense(id) {
+    const next = { ...roomData, expenses: (roomData.expenses || []).filter((e) => e.id !== id) };
+    writeRoomData(currentId, next);
+  }
+
+  const paper = { background: '#FAF6EE' };
+
+  // ---------- config error screen ----------
+  if (phase === 'configError') {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6" style={paper}>
+        <div className="max-w-sm rounded-lg p-5" style={{ background: '#fff', border: '1px solid #E8B9B9' }}>
+          <h1 className="font-bold mb-2" style={{ color: '#8A2F2F' }}>Firebaseの設定が未完了です</h1>
+          <p className="text-sm mb-2" style={{ color: '#6B6250' }}>
+            firebase-config.js に自分のFirebaseプロジェクトの値を入力してください。README.md の手順を参照してください。
+          </p>
+          {firebaseInitError && (
+            <p className="text-xs font-mono mt-2" style={{ color: '#C23B3B' }}>{firebaseInitError}</p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (phase === 'loading') {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={paper}>
+        <LoaderIcon size={28} style={{ color: '#C23B3B' }} />
+      </div>
+    );
+  }
+
+  // ---------- HOME ----------
+  if (phase === 'home') {
+    return (
+      <div className="min-h-screen" style={paper}>
+        <div className="max-w-md mx-auto px-5 py-8">
+          <header className="mb-6">
+            <div className="flex items-center gap-2" style={{ color: '#C23B3B' }}>
+              <StampIcon size={20} />
+              <span className="text-xs tracking-widest font-semibold" style={{ color: '#8A8067' }}>OUTING LEDGER</span>
+            </div>
+            <h1 className="text-2xl font-bold mt-1" style={{ color: '#1F2937', fontFamily: 'Georgia, serif' }}>立て替え帳</h1>
+            <p className="text-sm mt-1" style={{ color: '#6B6250' }}>お出かけごとに記録して、あとでまとめて精算する。</p>
+          </header>
+
+          <div className="rounded-lg p-4 mb-6" style={{ background: '#fff', border: '1px solid #E4DECB' }}>
+            <label className="text-xs font-semibold" style={{ color: '#8A8067' }}>新しい記録</label>
+            <div className="flex gap-2 mt-2">
+              <input value={newRoomName} onChange={(e) => setNewRoomName(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && createRoom()}
+                placeholder="例: 熱海旅行、飲み会"
+                className="flex-1 px-3 py-2 rounded border text-sm outline-none"
+                style={{ borderColor: '#D9D2C0', color: '#1F2937' }} />
+              <button onClick={createRoom} disabled={!newRoomName.trim() || creating}
+                className="px-3 py-2 rounded text-white text-sm font-semibold flex items-center gap-1 disabled:opacity-40"
+                style={{ background: '#C23B3B' }}>
+                <PlusIcon size={16} /> {creating ? '作成中…' : '作成'}
+              </button>
+            </div>
+            {createError && <p className="text-xs mt-2" style={{ color: '#C23B3B' }}>保存に失敗しました: {createError}</p>}
+          </div>
+
+          <div className="text-xs font-semibold mb-2" style={{ color: '#8A8067' }}>記録一覧</div>
+          {rooms.length === 0 && (
+            <p className="text-sm py-6 text-center" style={{ color: '#A39A82' }}>まだ記録がありません。上から作成してください。</p>
+          )}
+          <div className="space-y-2">
+            {rooms.map((r) => (
+              <button key={r.id} onClick={() => openRoom(r.id)}
+                className="w-full text-left rounded-lg p-4 flex items-center justify-between"
+                style={{ background: '#fff', border: '1px solid #E4DECB' }}>
+                <div>
+                  <div className="font-semibold text-sm" style={{ color: '#1F2937' }}>{r.name}</div>
+                  <div className="text-xs mt-0.5" style={{ color: '#A39A82' }}>
+                    {r.createdAt ? new Date(r.createdAt).toLocaleDateString('ja-JP') : ''}
+                  </div>
+                </div>
+                <ArrowRightIcon size={16} style={{ color: '#C23B3B' }} />
+              </button>
+            ))}
+          </div>
+
+          <p className="text-xs text-center mt-8" style={{ color: '#A39A82' }}>
+            このアプリのデータはリンクを知っている全員に共有されます。
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------- ROOM ----------
+  if (phase === 'room' && !roomData) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={paper}>
+        <LoaderIcon size={28} style={{ color: '#C23B3B' }} />
+      </div>
+    );
+  }
+
+  const members = roomData.members || [];
+  const expenses = roomData.expenses || [];
+  const { paid, owed, balance } = computeBalances(members, expenses);
+  const txns = settle(balance);
+  const total = expenses.reduce((s, e) => s + e.amount, 0);
+
+  return (
+    <div className="min-h-screen" style={paper}>
+      <div className="max-w-md mx-auto px-5 py-6">
+        <button onClick={goHome} className="flex items-center gap-1 text-sm mb-4" style={{ color: '#6B6250' }}>
+          <ChevronLeftIcon size={16} /> 一覧へ
+        </button>
+
+        {saveError && (
+          <div className="rounded-lg p-3 mb-3 text-sm" style={{ background: '#FBEAEA', border: '1px solid #E8B9B9', color: '#8A2F2F' }}>
+            {saveError}
+          </div>
+        )}
+
+        <h1 className="text-xl font-bold" style={{ color: '#1F2937', fontFamily: 'Georgia, serif' }}>{roomData.name}</h1>
+        <div className="text-xs mt-1" style={{ color: '#A39A82' }}>合計 {yen(total)}</div>
+
+        <Divider />
+
+        <div className="flex items-center gap-1.5 mb-2" style={{ color: '#8A8067' }}>
+          <UsersIcon size={14} /><span className="text-xs font-semibold">メンバー</span>
+        </div>
+        <div className="flex flex-wrap gap-2 mb-3">
+          {members.map((m) => (
+            <span key={m} className="flex items-center gap-1 pl-3 pr-1.5 py-1 rounded-full text-sm"
+              style={{ background: '#fff', border: '1px solid #E4DECB', color: '#1F2937' }}>
+              {m}
+              <button onClick={() => removeMember(m)} style={{ color: '#C4BBA3' }}><XIcon size={13} /></button>
+            </span>
+          ))}
+        </div>
+        <div className="flex gap-2 mb-6">
+          <input value={newMemberName} onChange={(e) => setNewMemberName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && addMember()}
+            placeholder="名前を追加"
+            className="flex-1 px-3 py-1.5 rounded border text-sm outline-none" style={{ borderColor: '#D9D2C0' }} />
+          <button onClick={addMember} disabled={!newMemberName.trim()}
+            className="px-3 py-1.5 rounded text-sm font-semibold disabled:opacity-40" style={{ background: '#3E6259', color: '#fff' }}>
+            追加
+          </button>
+        </div>
+
+        <Divider />
+
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-1.5" style={{ color: '#8A8067' }}>
+            <ReceiptIcon size={14} /><span className="text-xs font-semibold">支払い記録</span>
+          </div>
+          {!showAddExpense && (
+            <button onClick={() => setShowAddExpense(true)} disabled={members.length === 0}
+              className="text-xs font-semibold flex items-center gap-1 disabled:opacity-40" style={{ color: '#C23B3B' }}>
+              <PlusIcon size={14} /> 追加
+            </button>
+          )}
+        </div>
+
+        {members.length === 0 && <p className="text-sm py-3" style={{ color: '#A39A82' }}>先にメンバーを追加してください。</p>}
+
+        {showAddExpense && (
+          <div className="rounded-lg p-4 mb-3 space-y-3" style={{ background: '#fff', border: '1px solid #E4DECB' }}>
+            <input value={exDesc} onChange={(e) => setExDesc(e.target.value)} placeholder="内容(例: 居酒屋、コンビニ)"
+              className="w-full px-3 py-2 rounded border text-sm outline-none" style={{ borderColor: '#D9D2C0' }} />
+
+            <div>
+              <div className="text-xs mb-1" style={{ color: '#8A8067' }}>支払った人</div>
+              <div className="flex flex-wrap gap-2">
+                {members.map((m) => (
+                  <button key={m} onClick={() => setExPayer(m)} className="px-3 py-1 rounded-full text-xs border"
+                    style={{ borderColor: exPayer === m ? '#C23B3B' : '#D9D2C0', background: exPayer === m ? '#C23B3B' : '#fff', color: exPayer === m ? '#fff' : '#1F2937' }}>
+                    {m}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <div className="flex gap-2 text-xs mb-2">
+                <button onClick={() => setExSplitType('equal')} className="px-2.5 py-1 rounded"
+                  style={{ background: exSplitType === 'equal' ? '#3E6259' : '#F0EBDC', color: exSplitType === 'equal' ? '#fff' : '#6B6250' }}>均等割り</button>
+                <button onClick={() => setExSplitType('custom')} className="px-2.5 py-1 rounded"
+                  style={{ background: exSplitType === 'custom' ? '#3E6259' : '#F0EBDC', color: exSplitType === 'custom' ? '#fff' : '#6B6250' }}>個別入力</button>
+              </div>
+
+              {exSplitType === 'equal' ? (
+                <>
+                  <input value={exAmount} onChange={(e) => setExAmount(e.target.value.replace(/[^0-9]/g, ''))}
+                    placeholder="金額(税込)" inputMode="numeric"
+                    className="w-full px-3 py-2 rounded border text-sm outline-none font-mono mb-2" style={{ borderColor: '#D9D2C0' }} />
+                  <div className="flex flex-wrap gap-2">
+                    {members.map((m) => (
+                      <button key={m} onClick={() => toggleParticipant(m)} className="px-3 py-1 rounded-full text-xs border"
+                        style={{ borderColor: exParticipants.includes(m) ? '#3E6259' : '#D9D2C0', background: exParticipants.includes(m) ? '#3E6259' : '#fff', color: exParticipants.includes(m) ? '#fff' : '#1F2937' }}>
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div>
+                  {/* 品目を1件ずつ追加していくミニフォーム */}
+                  <div className="rounded p-2.5 space-y-2" style={{ background: '#FAF6EE', border: '1px solid #E4DECB' }}>
+                    <input value={itemName} onChange={(e) => setItemName(e.target.value)} placeholder="品名(任意、例: からあげ)"
+                      className="w-full px-2.5 py-1.5 rounded border text-sm outline-none" style={{ borderColor: '#D9D2C0' }} />
+                    <div className="flex gap-2">
+                      <input value={itemAmount} onChange={(e) => setItemAmount(e.target.value.replace(/[^0-9]/g, ''))}
+                        onKeyDown={(e) => e.key === 'Enter' && addItem()}
+                        placeholder="金額(税抜)" inputMode="numeric"
+                        className="flex-1 px-2.5 py-1.5 rounded border text-sm outline-none font-mono" style={{ borderColor: '#D9D2C0' }} />
+                      <button onClick={() => setItemTaxRate(8)} className="px-2 py-1 rounded text-xs border"
+                        style={{ borderColor: itemTaxRate === 8 ? '#3E6259' : '#D9D2C0', background: itemTaxRate === 8 ? '#3E6259' : '#fff', color: itemTaxRate === 8 ? '#fff' : '#6B6250' }}>8%</button>
+                      <button onClick={() => setItemTaxRate(10)} className="px-2 py-1 rounded text-xs border"
+                        style={{ borderColor: itemTaxRate === 10 ? '#3E6259' : '#D9D2C0', background: itemTaxRate === 10 ? '#3E6259' : '#fff', color: itemTaxRate === 10 ? '#fff' : '#6B6250' }}>10%</button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {members.map((m) => (
+                        <button key={m} onClick={() => setItemPerson(m)} className="px-3 py-1 rounded-full text-xs border"
+                          style={{ borderColor: itemPerson === m ? '#C23B3B' : '#D9D2C0', background: itemPerson === m ? '#C23B3B' : '#fff', color: itemPerson === m ? '#fff' : '#1F2937' }}>
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                    <button onClick={addItem} disabled={!itemAmount || !itemPerson}
+                      className="w-full py-1.5 rounded text-xs font-semibold disabled:opacity-40 flex items-center justify-center gap-1"
+                      style={{ background: '#3E6259', color: '#fff' }}>
+                      <PlusIcon size={13} /> この品目を追加
+                    </button>
+                  </div>
+
+                  {customItems.length > 0 && (
+                    <div className="mt-2 space-y-1">
+                      {customItems.map((it) => (
+                        <div key={it.id} className="flex items-center justify-between text-xs px-2.5 py-1.5 rounded" style={{ background: '#F0EBDC' }}>
+                          <span style={{ color: '#1F2937' }}>
+                            {it.person} ・ {it.name}
+                            <span style={{ color: '#A39A82' }}> (税抜{yen(it.amountExTax)}, {it.taxRate}%)</span>
+                          </span>
+                          <span className="flex items-center gap-2">
+                            <span className="font-mono font-semibold" style={{ color: '#1F2937' }}>{yen(taxIncluded(it.amountExTax, it.taxRate))}</span>
+                            <button onClick={() => removeItem(it.id)} style={{ color: '#C4BBA3' }}><XIcon size={12} /></button>
+                          </span>
+                        </div>
+                      ))}
+                      <div className="text-xs text-right pt-1 font-semibold" style={{ color: '#C23B3B' }}>
+                        合計(税込) {yen(customItems.reduce((s, it) => s + taxIncluded(it.amountExTax, it.taxRate), 0))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-2 pt-1">
+              <button onClick={addExpense} className="flex-1 py-2 rounded text-sm font-semibold text-white" style={{ background: '#C23B3B' }}>記録する</button>
+              <button onClick={resetExpenseForm} className="px-4 py-2 rounded text-sm" style={{ background: '#F0EBDC', color: '#6B6250' }}>やめる</button>
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-2 mb-6">
+          {expenses.map((e) => (
+            <div key={e.id} className="rounded-lg p-3" style={{ background: '#fff', border: '1px solid #E4DECB' }}>
+              <div className="flex items-start justify-between">
+                <div>
+                  <div className="text-sm font-medium" style={{ color: '#1F2937' }}>{e.desc}</div>
+                  <div className="text-xs mt-0.5" style={{ color: '#A39A82' }}>
+                    {e.payer} が支払い ・ {e.splitType === 'equal' ? `${e.participants.length}人で均等割り` : '個別割り(税込)'}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-sm font-semibold tabular-nums" style={{ color: '#1F2937' }}>{yen(e.amount)}</span>
+                  <button onClick={() => removeExpense(e.id)} style={{ color: '#C4BBA3' }}><XIcon size={14} /></button>
+                </div>
+              </div>
+              {e.splitType === 'custom' && Array.isArray(e.items) && e.items.length > 0 && (
+                <div className="mt-2 pt-2 space-y-1" style={{ borderTop: '1px dashed #E4DECB' }}>
+                  {e.items.map((it) => (
+                    <div key={it.id} className="flex items-center justify-between text-xs">
+                      <span style={{ color: '#8A8067' }}>{it.person} ・ {it.name}</span>
+                      <span className="font-mono" style={{ color: '#6B6250' }}>{yen(taxIncluded(it.amountExTax, it.taxRate))}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <Divider />
+
+        <div className="flex items-center gap-1.5 mb-2" style={{ color: '#8A8067' }}>
+          <StampIcon size={14} /><span className="text-xs font-semibold">精算</span>
+        </div>
+        <div className="rounded-lg p-4 mb-3" style={{ background: '#fff', border: '1px solid #E4DECB' }}>
+          {members.map((m) => (
+            <Stat key={m} label={`${m} (支払${yen(paid[m])} / 負担${yen(owed[m])})`}
+              value={`${balance[m] >= 0 ? '+' : ''}${yen(balance[m])}`}
+              tone={balance[m] > 0.5 ? 'plus' : balance[m] < -0.5 ? 'minus' : undefined} />
+          ))}
+        </div>
+
+        {txns.length === 0 ? (
+          <div className="rounded-lg p-4 text-center text-sm" style={{ background: '#F0EBDC', color: '#6B6250' }}>
+            {expenses.length === 0 ? 'まだ支払い記録がありません。' : '全員の精算が完了しています。'}
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {txns.map((t, i) => (
+              <div key={i} className="rounded-lg p-3 flex items-center justify-between" style={{ background: '#fff', border: '1px solid #E4DECB' }}>
+                <div className="flex items-center gap-2 text-sm" style={{ color: '#1F2937' }}>
+                  <span className="font-semibold">{t.from}</span>
+                  <ArrowRightIcon size={14} style={{ color: '#C23B3B' }} />
+                  <span className="font-semibold">{t.to}</span>
+                </div>
+                <span className="font-mono text-sm font-semibold" style={{ color: '#C23B3B' }}>{yen(t.amount)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error(error, info); }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ background: '#FAF6EE', minHeight: '100vh', padding: '24px' }}>
+          <div style={{ background: '#fff', border: '1px solid #E8B9B9', borderRadius: 8, padding: 16 }}>
+            <h1 style={{ color: '#8A2F2F', fontWeight: 'bold', marginBottom: 8 }}>画面の表示中にエラーが発生しました</h1>
+            <pre style={{ whiteSpace: 'pre-wrap', color: '#C23B3B', fontSize: 12, fontFamily: 'monospace' }}>
+              {String(this.state.error && (this.state.error.stack || this.state.error.message || this.state.error))}
+            </pre>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App /></ErrorBoundary>);
+</script>
+</body>
+</html>
